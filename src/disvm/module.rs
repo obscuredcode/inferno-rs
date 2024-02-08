@@ -1,9 +1,7 @@
 use std::error::Error;
-use std::fmt::{Debug, Formatter, write};
+use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::Read;
-use modular_bitfield::error::InvalidBitPattern;
-//use modular_bitfield::{bitfield, BitfieldSpecifier};
 use modular_bitfield::prelude::*;
 use crate::disvm::consts::*;
 
@@ -146,6 +144,7 @@ pub enum Operand {
     Word(i32)
 }
 
+#[allow(dead_code)]
 impl Operand {
     #[inline]
     pub fn size(self) -> usize {
@@ -440,9 +439,6 @@ pub fn parse_word(bytes: &[u8]) -> i32 {
     i32::from_be_bytes(buf)
 }
 
-pub fn parse_header(buf: &[u8]) {
-    let first: u8 ;
-}
 
 #[derive(Debug)]
 pub struct DisModule {
@@ -563,7 +559,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
     offset += entry_type.size();
     dis.entry_type = entry_type.into_i32();
 
-    if (code_size.into_i32() < 0 || data_size.into_i32()  < 0 || type_size.into_i32()  < 0 || link_size.into_i32() < 0) {
+    if code_size.into_i32() < 0 || data_size.into_i32()  < 0 || type_size.into_i32()  < 0 || link_size.into_i32() < 0 {
         panic!("Invalid sizes in module header {:?}.", dis);
     }
 
@@ -573,7 +569,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
     //let mut code_vec : Vec<Instruction> = Vec::with_capacity(code_size.into_usize());
     dis.code = Vec::with_capacity(code_size.into_usize());
 
-    for i in 0..code_size.into_usize() {
+    for _i in 0..code_size.into_usize() {
         // read single instruction
         let mut ins = Instruction::new();
         let opadr = buffer.get(offset..offset+2).expect("Unable to read opcode and addressing mode");
@@ -581,7 +577,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
         ins.address = OpAddressMode::from_bytes([opadr[1]]);
         offset += 2;
 
-        if (ins.address.middle_op_mode() != MiddleOpMode::None) {
+        if ins.address.middle_op_mode() != MiddleOpMode::None {
             let data = parse_operand(buffer.get(offset..offset+4).expect("Unable to read middle operand data"));
             offset += data.size();
 
@@ -599,7 +595,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             }
         }
 
-        if (ins.address.source_op_mode() != SourceDestOpMode::None) {
+        if ins.address.source_op_mode() != SourceDestOpMode::None {
             let data = parse_operand(buffer.get(offset..offset+4).expect("Unable to read source operand data"));
             offset += data.size();
 
@@ -633,7 +629,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             }
         }
 
-        if (ins.address.dest_op_mode() != SourceDestOpMode::None) {
+        if ins.address.dest_op_mode() != SourceDestOpMode::None {
             let data = parse_operand(buffer.get(offset..offset+4).expect("Unable to read dest operand data"));
             offset += data.size();
 
@@ -663,14 +659,14 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             }
         }
 
-        //println!("Instruction {} is {:?}", i, ins);
+        //println!("Instruction {} is {:?}", _i, ins);
         dis.code.push(ins);
 
     }
 
     // read type descriptors
 
-    for i in 0..dis.type_size {
+    for _i in 0..dis.type_size {
         // read single type
         let mut type_desc = Type::new();
         let desc_no = parse_operand(buffer.get(offset..offset+4).expect("Unable to read type descriptor"));
@@ -685,7 +681,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
         offset += map_size.size();
         type_desc.map_size = map_size.into_i32();
 
-        for j in 0..type_desc.map_size {
+        for _j in 0..type_desc.map_size {
             let map_byte = buffer.get(offset..offset+1).expect("Unable to read map byte");
             offset += 1;
 
@@ -699,7 +695,6 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
     // setup array parsing stack
     // setup base data address
     let mut base_address: usize = 0;
-
     let mut i = 0;
     'data: loop {
 
@@ -711,12 +706,12 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
 
         offset += 1;
         
-        if (code.bytes[0] == 0) {
+        if code.bytes[0] == 0 {
             break 'data;
         }
 
         let mut count = code.count() as i32;
-        if (count == 0) {
+        if count == 0 {
             let countopt = parse_operand(buffer.get(offset..offset+4).expect("Unable to read data countop"));
             offset += countopt.size();
             count = countopt.into_i32();
@@ -733,7 +728,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             Ok(DataCodeType::Byte) => {
                 //println!("Found {} bytes", count);
                 let mut bytes: Vec<u8> = vec![];
-                for j in 0..count {
+                for _j in 0..count {
                     let byte = buffer.get(offset..offset+1).expect("Unable to read data byte")[0];
                     offset += 1;
                     // read into dest_address
@@ -746,7 +741,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             Ok(DataCodeType::Integer32) => {
                 //println!("Found {} integers", count);
                 let mut integers: Vec<i32> = vec![];
-                for j in 0..count {
+                for _j in 0..count {
                     let word = parse_word(buffer.get(offset..offset+4).expect("Unable to read data int32"));
                     offset += 4;
                     // read into dest_address
@@ -760,14 +755,14 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                 //chars.copy_from_slice(buffer.get(offset..offset+count as usize).expect("Unable to read utf8 string"));
 
                 let chars = String::from_utf8_lossy(buffer.get(offset..offset+count as usize).expect("Unable to read utf8 string"));
-                //println!("string {} is {}", i, chars);
+                //println!("string {} is {}", _i, chars);
                 offset += count as usize;
                 data.data = Data::String(chars.to_string());
             }
             Ok(DataCodeType::Float) => {
                 //println!("found {} floats", count);
                 let mut floats: Vec<f64> = vec![];
-                for j in 0..count {
+                for _j in 0..count {
                     let mut bytes: [u8; 8] = [0; 8];
                     bytes.copy_from_slice(buffer.get(offset..offset+4).expect("Unable to read data float64"));
                     let float = f64::from_be_bytes(bytes);
@@ -778,7 +773,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             Ok(DataCodeType::Array) => {
                 let array_type = parse_word(buffer.get(offset..offset+4).expect("Unable to read array type"));
                 offset += 4;
-                if (array_type < 0) {
+                if array_type < 0 {
                     // deal with invalid type
                 }
 
@@ -791,7 +786,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                 let array_index = parse_word(buffer.get(offset..offset+4).expect("Unable to read array base address"));
                 offset += 4;
 
-                if (array_index < 0) {
+                if array_index < 0 {
                     // invalid index
                 }
                 // the current dest_address should refer to an array
@@ -806,7 +801,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             Ok(DataCodeType::Integer64) => {
                // println!("found {} int64s", count);
                 let mut integers: Vec<i64> = vec![];
-                for j in 0..count {
+                for _j in 0..count {
                     let mut buf: [u8; 8] = [0; 8];
                     buf.copy_from_slice(buffer.get(offset..offset+8).expect("Unable to read int64 datum"));
                     let big = i64::from_be_bytes(buf);
@@ -817,7 +812,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                 data.data = Data::Integer64(integers);
             }
             Err(bits) => {
-               // println!("Invalid bytes {}", bits.invalid_bytes);
+               panic!("Invalid data code bytes {}", bits.invalid_bytes);
             }
         }
         dis.data.push(data);
@@ -829,7 +824,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
     loop {
         let c = buffer.get(offset..offset+1).expect("Unable to read module name")[0];
         offset += 1;
-        if (c == 0) {
+        if c == 0 {
             break;
         }
         dis.module_name.push(c as char)
@@ -838,7 +833,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
 
     // link/export section
 
-    for i in 0..dis.link_size {
+    for _i in 0..dis.link_size {
         let mut export = Export::new();
         let entry_pc = parse_operand(buffer.get(offset..offset+4).expect("Unable to read export entry pc"));
         offset += entry_pc.size();
@@ -854,7 +849,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
         loop {
             let c = buffer.get(offset..offset+1).expect("Unable to read export function name")[0];
             offset += 1;
-            if (c == 0) {
+            if c == 0 {
                 break;
             }
             export.fn_name.push(c as char);
@@ -865,19 +860,19 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
 
     // import section
 
-    if (dis.runtime_flag.to_i16().unwrap() & DisRuntimeFlag::HASLDT2.to_i16().unwrap() != 0) {
+    if dis.runtime_flag.to_i16().unwrap() & DisRuntimeFlag::HASLDT2.to_i16().unwrap() != 0 {
         let module_import_count = parse_operand(buffer.get(offset..offset+4).expect("Unable to read import module count"));
         offset += module_import_count.size();
         let module_import_count = module_import_count.into_usize();
 
-        for i in 0..module_import_count {
+        for _i in 0..module_import_count {
             let mut module_imports = ModuleImport::new();
 
             let import_count = parse_operand(buffer.get(offset..offset+4).expect("Unable to read import count"));
             offset += import_count.size();
             let import_count = import_count.into_usize();
 
-            for j in 0..import_count {
+            for _j in 0..import_count {
                 let mut import = Import::new();
 
                 import.sig = parse_word(buffer.get(offset..offset+4).expect("Unable to read import type checksum"));
@@ -886,7 +881,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                 loop {
                     let c = buffer.get(offset..offset+1).expect("Unable to read import function name")[0];
                     offset += 1;
-                    if (c == 0) {
+                    if c == 0 {
                         break;
                     }
                     import.fn_name.push(c as char);
@@ -902,7 +897,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
 
     // handler section
 
-    if (dis.runtime_flag.to_i16().unwrap() & DisRuntimeFlag::HASEXCEPT.to_i16().unwrap() != 0) {
+    if dis.runtime_flag.to_i16().unwrap() & DisRuntimeFlag::HASEXCEPT.to_i16().unwrap() != 0 {
         let mut handler = HandlerSection::new();
 
         let handler_offset = parse_operand(buffer.get(offset..offset+4).expect("Unable to read handler offset"));
@@ -911,7 +906,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
 
         let pc_start = parse_operand(buffer.get(offset..offset+4).expect("Unable to read handler pc start"));
         offset += pc_start.size();
-        handler.pc_start = pc_start.into_i32();;
+        handler.pc_start = pc_start.into_i32();
 
         let pc_end = parse_operand(buffer.get(offset..offset+4).expect("Unable to read handler pc end"));
         offset += pc_end.size();
@@ -931,12 +926,12 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
         offset += handler_count.into_usize();
         let handler_count = handler_count.into_usize();
 
-        for i in 0..handler_count {
+        for _i in 0..handler_count {
             let mut exception_handler = ExceptionHandler::new();
             loop {
                 let c = buffer.get(offset..offset+1).expect("Unable to read exception handler function name")[0];
                 offset += 1;
-                if (c == 0) {
+                if c == 0 {
                     break;
                 }
                 exception_handler.name.push(c as char);
@@ -957,7 +952,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
     loop {
         let c = buffer.get(offset..offset+1).expect("Unable to read module src path")[0];
         offset += 1;
-        if (c == 0) {
+        if c == 0 {
             break;
         }
         dis.module_src_path.push(c as char)

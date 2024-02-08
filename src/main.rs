@@ -5,8 +5,6 @@ extern crate modular_bitfield;
 
 mod disvm;
 
-use crate::disvm::opcode::Opcode;
-
 use crate::disvm::module::load_module;
 
 fn main() {
