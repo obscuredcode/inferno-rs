@@ -1,5 +1,4 @@
-use std::ptr::read;
-use module::{load_module, Operand, parse_operand};
+use module::{Operand, parse_operand};
 
 pub struct BufferedReader<'a> {
     pub(crate) buffer: &'a Vec<u8>,

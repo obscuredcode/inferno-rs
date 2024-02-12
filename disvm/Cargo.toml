@@ -4,6 +4,9 @@ description = "Dis Virtual Machine implementation"
 
 [lib]
 
+[features]
+emulated_ptrs = []
+
 [[test]]
 name = "tests"
 path = "tests/common.rs"

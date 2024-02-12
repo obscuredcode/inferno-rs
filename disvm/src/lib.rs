@@ -1,3 +1,5 @@
+#![feature(allocator_api)]
+
 #[macro_use]
 extern crate enum_primitive_derive;
 extern crate num_traits;

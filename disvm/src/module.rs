@@ -1,22 +1,16 @@
 use data::VmPtr;
-use std::alloc::Layout;
 use std::cell::RefCell;
-use std::convert::TryInto;
 use std::error::Error;
-use std::ffi::CStr;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::io::Read;
-use std::mem::size_of_val;
 use std::rc::Rc;
 use num_traits::{FromPrimitive, ToPrimitive};
 use modular_bitfield::prelude::*;
-use presser::{copy_from_slice_to_offset, copy_to_offset, Slab};
 use consts::*;
 
 use opcode::{INSTR_MNEMONICS, Opcode};
-use data;
-use data::{Data, DataCodeType, Heap, ModuleGlobalData, DataCode};
+use data::{Data, DataCodeType, ModuleData, DataCode};
 use util::BufferedReader;
 
 #[derive(BitfieldSpecifier, Debug, Eq, PartialEq, Copy, Clone)]
@@ -242,9 +236,9 @@ pub struct TypeMap {
 
 impl Debug for TypeMap {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f,"[");
+        writeln!(f,"[")?;
         for b in &self.bytes {
-            writeln!(f, "   {b:08b},")?
+            writeln!(f, "   {b:08b},")?;
         }
         write!(f, "]")
     }
@@ -273,7 +267,7 @@ impl Type {
 
         let bit_index = 7 - (offset % 32)/4;
 
-        if (byte_index < self.map_size as usize) {
+        if byte_index < self.map_size as usize {
             let byte_map = self.map.bytes[(self.map_size as usize - byte_index) - 1];
             // lowest offset is mapped to highest bit
 
@@ -618,7 +612,6 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
 
     for _i in 0..code_size.into_usize() {
         // read single instruction
-        let mut ins_start = offset;
         let mut ins = Instruction::new();
         let opadr = buffer.get(offset..offset+2).expect("Unable to read opcode and addressing mode");
         ins.opcode = Opcode::from_u8(opadr[0]);
@@ -676,7 +669,6 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
                 }
             }
         }
-        let s = ins.address.bytes[0] & 0x07;
 
         if ins.address.dest_op_mode() != SourceDestOpMode::None {
             let data = parse_operand(buffer.get(offset..offset+4).expect("Unable to read dest operand data"));
@@ -744,18 +736,18 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
         if desc.desc_no == MODULE_TYPE_DESC {
             //println!("{:#?}", desc);
             println!("Module Type Descriptor: ");
-            if (desc.size != dis.data_size) {
+            if desc.size != dis.data_size {
                 panic!("Module type descriptor invalid");
             }
         }
         //println!("{:#?}", desc);
     }
 
-    let mut md = Heap::new(&dis.types[0]);
+    let mut md = ModuleData::new(&dis.types[0]);
 
     let buffer_copy = buffer.clone();
 
-    let mut reader = Rc::new(RefCell::new(BufferedReader {
+    let reader = Rc::new(RefCell::new(BufferedReader {
         buffer: &buffer_copy,
         offset: offset,
         error: "".to_string()
@@ -763,31 +755,7 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
 
 
     // read data
-    // setup array parsing stack
-    let mut array_stack: Vec<usize> = Vec::with_capacity(ARRAY_PARSER_STACK);
-    // setup base data address
-    let data_size = dis.data_size as usize;
 
-    let mut module_data_vec: Vec<u8> = Vec::with_capacity(data_size);
-    //module_data_vec.fill(0);
-    for _i in 0..data_size {
-        module_data_vec.push(0);
-    }
-
-   // let mut m = unsafe { ModuleData::new(dis.types[0].clone()) }.unwrap();
-    /*let s = runtime::ctypes::String {
-        len: 1,
-        max: 2,
-        _tmp: 3,
-        data: [4, 5, 6, 7],
-    };
-    m.write_offset(s, 0);*/
-
-    let mut m = ModuleGlobalData::new();
-
-    let mut base_address: usize = 0;
-
-    let mut i = 0;
     'data: loop {
         let mut data = DataSection::new();
         let mut count = 0;
@@ -795,16 +763,9 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
         {
             let mut  r = reader.borrow_mut();
             code = DataCode::from_bytes([r.u8()]);
-
-            ;/*DataCode::from_bytes([buffer.get(offset..offset+1).
-                                                                expect("Unable to read data code")[0]]);*/
-            //offset += 1;
-
             if code.is_zero() {
                 break 'data;
             }
-
-
             count = code.get_count() as i32;
             if count == 0 {
                 let countopt = r.operand(); //parse_operand(buffer.get(offset..offset+4).expect("Unable to read data countop"));
@@ -812,161 +773,11 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
                 count = countopt.into_i32();
                 data.countopt = Some(count)
             }
-
             if count < 0 {
-                panic!("Invalid data count {count}");
+                panic!("Invalid data count {} for {:?}", count, code);
             }
-
-           // let data_offset = r.operand(); //parse_operand(buffer.get(offset..offset+4).expect("Unable to read data offset"));
-            //offset += data_offset.size();
-
-
-            //let mut dest_address = base_address + data_offset.into_usize();
-            //data.offset = dest_address as i32; //data_offset.into_i32();
-            //data.code = code;
         }
-        //m.load_data(count as usize, &mut data, &dis.types, reader.clone());
         md.load_data(code, count as usize, &dis.types, reader.clone());
-        /*match code.data_type_or_err() {
-            Ok(DataCodeType::Byte) => {
-                //println!("Found {} bytes", count);
-                let mut bytes: Vec<u8> = vec![];
-                for _j in 0..count {
-                    let byte = buffer.get(offset..offset+1).expect("Unable to read data byte")[0];
-                    offset += 1;
-                    // read into dest_address
-                    //copy_to_offset(&byte, &mut slab, dest_address);
-                    bytes.push(byte);
-                }
-                data.data = Data::Byte(bytes);
-                println!("offset {}, wanted: {}: {:?}",
-                         data.offset,
-                         data_offset.into_usize(),
-                        &data.data);
-                m.set(dest_address, data.data);
-                dest_address += 4;
-            }
-            Ok(DataCodeType::Integer32) => {
-                //println!("Found {} integers", count);
-                let mut integers: Vec<i32> = vec![];
-                for _j in 0..count {
-                    let word = parse_word(buffer.get(offset..offset+4).expect("Unable to read data int32"));
-                    offset += 4;
-                    // read into dest_address
-                    //copy_to_offset(&word, &mut slab, dest_address);
-                    integers.push(word);
-                }
-
-                data.data = Data::Integer32(integers);
-                println!("offset {}, wanted: {}: {:?}",
-                         data.offset,
-                         data_offset.into_usize(),
-                         &data.data);
-                m.set(dest_address, data.data);
-                dest_address += 4;
-            }
-            Ok(DataCodeType::StringUTF) => {
-                //let mut chars: String = String::with_capacity(count as usize);
-                //chars.copy_from_slice(buffer.get(offset..offset+count as usize).expect("Unable to read utf8 string"));
-
-                let chars = String::from_utf8_lossy(buffer.get(offset..offset+count as usize).expect("Unable to read utf8 string"));
-                //println!("string {} is {}", _i, chars);
-                offset += count as usize;
-                data.data = Data::String(chars.to_string());
-                //copy_from_slice_to_offset(chars.as_bytes(), &mut slab, dest_address);
-                println!("offset {}, wanted: {}: {:?}",
-                         data.offset,
-                         data_offset.into_usize(),
-                         &data.data);
-                m.set(dest_address, data.data);
-                dest_address += 4;
-            }
-            Ok(DataCodeType::Float) => {
-                //println!("found {} floats", count);
-                let mut floats: Vec<f64> = vec![];
-                for _j in 0..count {
-                    let mut bytes: [u8; 8] = [0; 8];
-                    bytes.copy_from_slice(buffer.get(offset..offset+4).expect("Unable to read data float64"));
-                    let float = f64::from_be_bytes(bytes);
-                    offset += 8;
-                    floats.push(float);
-                }
-                data.data = Data::Float(floats);
-                m.set(dest_address, data.data);
-                dest_address += 4;
-            }
-            Ok(DataCodeType::Array) => {
-                let array_type = parse_word(buffer.get(offset..offset+4).expect("Unable to read array type"));
-                offset += 4;
-                if array_type < 0 {
-                    // deal with invalid type
-                }
-
-                let array_elements_count = parse_word(buffer.get(offset..offset+4).expect("Unable to read array elements count"));
-                offset += 4;
-
-                data.data = Data::Array(array_type, array_elements_count, vec![]);
-                println!("offset {}, wanted: {}: {:?}",
-                         data.offset,
-                         data_offset.into_usize(),
-                         &data.data);
-                m.set(dest_address, data.data);
-                dest_address += 4;
-            }
-            Ok(DataCodeType::ArraySetIndex) => {
-                let array_index = parse_word(buffer.get(offset..offset+4).expect("Unable to read array base address"));
-                offset += 4;
-
-                if array_index < 0 {
-                    // invalid index
-                }
-                // the current dest_address should refer to an array
-                let arr = m.get(dest_address);
-                match &arr {
-                    Data::Array(t, c, _) => {
-                        let typ = &dis.types[*t as usize];
-                        println!("array typ: {:?}, count: {}", typ, *c);
-                    }
-                    _ => {
-                        panic!("set index isn't following array")
-                    }
-                }
-                // push current base address
-                array_stack.push(base_address);
-                // load new base address from array_index
-                //base_address = array_index as usize + 4;
-                m.set_index(array_index as usize, base_address, &dis.types);
-
-            }
-            Ok(DataCodeType::RestoreBase) => {
-                // pop current base address
-                let new = array_stack.pop().expect("Attempted to restore array base address when none was saved");
-                println!("restored base from {} to {}", base_address, new);
-                base_address = new;
-            }
-            Ok(DataCodeType::Integer64) => {
-               // println!("found {} int64s", count);
-                let mut integers: Vec<i64> = vec![];
-                for _j in 0..count {
-                    let mut buf: [u8; 8] = [0; 8];
-                    buf.copy_from_slice(buffer.get(offset..offset+8).expect("Unable to read int64 datum"));
-                    let big = i64::from_be_bytes(buf);
-                    //print!("\t datum {} is {}", j, big);
-                    offset += 8;
-                    integers.push(big);
-                }
-                data.data = Data::Integer64(integers);
-                m.set(dest_address, data.data);
-                dest_address += 4;
-            }
-            Err(bits) => {
-               panic!("Invalid data code bytes {}", bits.invalid_bytes);
-            }
-        }*/
-
-
-        //dis.data.push(data);
-        i += 1;
     }
 
     offset = reader.borrow().offset;
@@ -995,11 +806,6 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
         op += 1;
     }
 
-    //println!("{:#?}", m);
-    /*unsafe {
-        let s = CStr::from_ptr(slab.base_ptr().add(4) as *const i8);
-        println!("{:?}", s)
-    }*/
 
     // read module name
 

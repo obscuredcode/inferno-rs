@@ -1,16 +1,13 @@
-use std::alloc::{Layout, LayoutError};
+
+use std::alloc::{AllocError, Layout, LayoutError};
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
-use std::ops::AddAssign;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use libc::pgn_t;
 use module::{DataSection, Type};
 use module::TypeMap;
-use data::Location::Module;
 use modular_bitfield::prelude::*;
-use modular_bitfield::private::static_assertions::const_assert;
 use util::BufferedReader;
 
 
@@ -38,6 +35,9 @@ pub mod ctypes {
 }
 const PointerMap: i32 = 0x80;
 
+const MP_HEAP_START: u64 = 8u64 << 16;
+const HEAP_START: u64 = 1u64 << 8;
+
 const Tstring: Type = Type {
     desc_no: 0,
     size: std::mem::size_of::<String>() as i32,
@@ -45,6 +45,7 @@ const Tstring: Type = Type {
     map: TypeMap { bytes: vec![] },
 };
 
+//<editor-fold desc="ModuleData Data Types">
 #[derive(Copy, Clone)]
 #[bitfield(bits=8)]
 pub struct DataCode {
@@ -81,12 +82,13 @@ impl Display for DataCode {
 }
 
 impl DataCode {
+
     pub fn is_zero(&self) -> bool {
         return self.bytes[0] == 0;
     }
 
     pub fn get_count(&self) -> u8 {
-        return self.count();
+        return self.count() as u8;
     }
 }
 
@@ -135,6 +137,30 @@ impl Debug for Data {
     }
 }
 
+
+#[derive(Debug)]
+pub enum ModuleDataError {
+    OutOfMemory,
+    BadAllocation
+}
+
+impl Display for ModuleDataError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for ModuleDataError {
+
+}
+
+impl From<LayoutError> for ModuleDataError {
+    fn from(value: LayoutError) -> Self {
+        ModuleDataError::BadAllocation
+    }
+}
+//</editor-fold>
+
 #[derive(Clone)]
 pub struct VmArray {
     typ: Type,
@@ -172,6 +198,13 @@ impl Debug for VmArray {
                             })?;
         }
         write!(f, " ]")
+    }
+}
+impl Drop for VmArray {
+    fn drop(&mut self) {
+        unsafe {
+            std::alloc::dealloc(self.ptr.as_ptr(), self.layout);
+        }
     }
 }
 impl VmArray {
@@ -212,27 +245,6 @@ impl VmArray {
     }
 }
 
-#[derive(Debug)]
-pub enum ModuleDataError {
-    OutOfMemory,
-    BadAllocation
-}
-
-impl Display for ModuleDataError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl Error for ModuleDataError {
-
-}
-
-impl From<LayoutError> for ModuleDataError {
-    fn from(value: LayoutError) -> Self {
-        ModuleDataError::BadAllocation
-    }
-}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
 #[repr(i32)]
@@ -255,7 +267,7 @@ enum BasePtr {
     }
 }
 
-pub struct Heap {
+pub struct ModuleData {
     heap: NonNull<u8>,
     size: usize,
     pub(crate) ptr_table: std::collections::HashMap<VmPtr, Data>,
@@ -264,36 +276,21 @@ pub struct Heap {
     base: BasePtr,
     array_stack: Vec<BasePtr>,
     array_offset: usize,
-    last_array: VmPtr
-    //layout: Layout
+    last_array: VmPtr,
+    heap_start: usize,
 }
 
+const HEAP_SIZE: usize = 1024*1024;
 
-impl Heap {
-    /*pub unsafe fn new(module_type_desc: Type) -> Result<Self, ModuleDataError> {
-        let size = module_type_desc.size as usize;
-        let layout = Layout::from_size_align(size, 1)?;
-        let ptr = std::alloc::alloc_zeroed(layout);
-
-        let mut start = ptr as *mut i32;
-
-
-
-        if ptr.is_null() {
-            Err(ModuleDataError::OutOfMemory)
-        } else {
-            Ok(Self {
-                heap: NonNull::new_unchecked(ptr),
-                layout: layout
-            })
-        }
-    }*/
+impl ModuleData {
     pub fn new(module_type_desc: &Type) -> Self {
-        let size = module_type_desc.size as usize;
+        let heap_start = module_type_desc.size as usize;
+        let size =  heap_start + HEAP_SIZE;
+        println!("MP Heap size: {}", size);
         unsafe {
             let raw = libc::mmap(
-                (1u64 << 16) as *mut libc::c_void,
-                size,
+                MP_HEAP_START as *mut libc::c_void,
+                size+HEAP_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE |
                     libc::MAP_ANONYMOUS | libc::MAP_32BIT,
@@ -316,7 +313,8 @@ impl Heap {
                 base: BasePtr::Module,
                 array_stack: Default::default(),
                 array_offset: 0,
-                last_array: VmPtr::Ptr(-1)
+                last_array: VmPtr::Ptr(-1),
+                heap_start: heap_start
             }
         }
     }
@@ -358,6 +356,15 @@ impl Heap {
         self.allocated.push(ptr);
         ptr
     }
+    pub fn read_ptr(&self, ptr: &VmPtr) -> Option<&Data> {
+        let mut data: Option::<&Data> = None;
+
+        if (ptr.as_i32() != - 1) {
+            data = self.ptr_table.get(&ptr)
+        };
+
+        data
+    }
     pub fn write<T: Debug>(&mut self, src: T, offset: usize) {
         match self.base {
             BasePtr::Module => {
@@ -384,10 +391,7 @@ impl Heap {
 
     pub fn get(&self, offset: usize) -> Option<&Data> {
         let ptr: VmPtr = VmPtr::Ptr(self.read::<i32>(offset));
-        if ptr.as_i32() == -1 {
-            return None;
-        }
-        self.ptr_table.get(&ptr)
+        self.read_ptr(&ptr)
     }
 
     pub fn set_index(&mut self, array_index: usize) {
@@ -430,6 +434,7 @@ impl Heap {
         data.offset = offset as i32; //data_offset.into_i32();
         data.code = code;
 
+        //<editor-fold desc="Loading data into heap">
         match data.code.data_type_or_err() {
             Ok(DataCodeType::Byte) => {
                 for _j in 0..count {
@@ -502,10 +507,11 @@ impl Heap {
                 panic!("Invalid DataCode Type: {:?}", err.invalid_bytes)
             }
         }
+        //</editor-fold>
     }
 }
 
-impl Drop for Heap {
+impl Drop for ModuleData {
     fn drop(&mut self) {
         unsafe {
             //std::alloc::dealloc(self.heap.as_ptr(), self.layout);
@@ -529,266 +535,78 @@ pub enum DataCodeType {
 }
 
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-enum Location {
-    Module(usize),
-    Array(usize)
+pub struct HeapPtr {
+    ptr: u32
 }
 
-impl Location {
-    pub fn as_i32(&self) -> i32 {
-        match *self {
-            Location::Module(i) => {i as i32}
-            Location::Array(i) => {i as i32}
-        }
+impl HeapPtr {
+    pub fn as_ptrT<T>(&self) -> *const T {
+        self.ptr as *const T
     }
-    pub fn as_usize(&self) -> usize {
-        match *self {
-            Module(i) => {i}
-            Location::Array(i) => {i}
-        }
+    pub fn as_ptrT_mut<T>(&self) -> *mut T {
+        self.ptr as *mut T
     }
 }
 
-impl AddAssign<usize> for Location {
-    fn add_assign(&mut self, rhs: usize) {
-        *self = match *self {
-            Module(i) => {Location::Module(i+rhs)}
-            Location::Array(i) => {Location::Array(i+rhs)}
+
+
+//<editor-fold desc="Heap Allocator">
+/*pub struct Heap {
+    heap: NonNull<u8>,
+    size: usize,
+    top: usize,
+}
+
+impl Heap {
+    pub fn new(module_type_desc: &Type) -> Self {
+        let size = module_type_desc.size as usize;
+        println!("Heap size: {}", size);
+        unsafe {
+            let raw = libc::mmap(
+                HEAP_START as *mut libc::c_void,
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE |
+                    libc::MAP_ANONYMOUS | libc::MAP_32BIT,
+                -1,
+                0
+
+            );
+            if raw.is_null() {
+                panic!("Unable to create VM Heap");
+            }
+
+            Self {
+                heap: NonNull::new_unchecked(raw as *mut u8),
+                size,
+                top: 0,
+            }
         }
     }
 }
 
-#[derive(Debug)]
-pub struct ModuleGlobalData {
-    pub map: std::collections::HashMap<i32, Data>,
-    array_stack: Vec<Location>,
-    base: Location,
-    current: Location
-}
-
-impl ModuleGlobalData {
-    pub fn new() -> Self {
-        Self {
-            map: Default::default(),
-            array_stack: Vec::with_capacity(16),
-            base: Module(0),
-            current: Module(0)
-        }
-    }
-    pub fn set_index(&mut self, array_index: usize, type_descs: &Vec<Type>) {
-        // the last thing we added must have been an array
-        let current_datum= self.current.as_i32();
-
-        /*let mut arr = self.map.get_mut(&current_datum).expect("array must precede set index");
-
-        let (c, t): (i32, i32) = match arr {
-            Data::Array(c, t, _) => (*c, *t),
-            _ => panic!("set index not following array")
+#[allow(unstable_features)]
+unsafe impl std::alloc::Allocator for Heap {
+    fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let size = layout.size();
+        let ptr = unsafe {
+            NonNull::new_unchecked(self.heap.as_ptr().add(self.top))
         };
-
-        if c < 0 || t < 0 {
-            panic!("invalid array {:?}", arr)
-        }
-
-        let t: &Type = &type_descs[t as usize];
-
-        let array_start = array_index;*/
-        self.array_stack.push(self.base);
-
-        self.base = Location::Array(current_datum as usize);
-
+        self.top += size;
+        Ok(ptr)
     }
 
-
-
-    pub fn restore(&mut self) {
-        self.base = self.array_stack.pop().expect("no array base address to restore");
-    }
-
-    pub fn load_data(&mut self,
-                     count: usize,
-                     data: &mut DataSection,
-                     type_descs: &Vec<Type>,
-                     buffer: Rc<RefCell<BufferedReader>>) {
-        let mut buffer = buffer.borrow_mut();
-        let offset = data.offset as usize;
-        let in_array = match self.base {
-            Module(_) => { false }
-            Location::Array(_) => { true }
-        };
-        let mut do_nothing = false;
-        //self.current = self.base;
-        match data.code.data_type_or_err() {
-            Ok(DataCodeType::Byte) => {
-                //println!("Found {} bytes", count);
-                let mut bytes: Vec<u8> = vec![];
-                for _j in 0..count {
-                    let byte = buffer.u8e("Unable to read data byte");
-                    bytes.push(byte);
-                    if in_array {
-                        self.put(offset, Datum::Byte(byte));
-                    }
-
-                }
-                data.data = Data::Byte(bytes);
-            }
-            Ok(DataCodeType::Integer32) => {
-                //println!("Found {} integers", count);
-                let mut integers: Vec<i32> = vec![];
-                for _j in 0..count {
-                    let word = buffer.i32();
-                    integers.push(word);
-                    if in_array {
-                        self.put(offset, Datum::Integer32(word));
-                    }
-                }
-                data.data = Data::Integer32(integers);
-            }
-            Ok(DataCodeType::StringUTF) => {
-                let chars = String::from_utf8_lossy(buffer.reade(count, "Unable to read utf8 string"));
-                if in_array {
-                    self.put(offset, Datum::String(chars.to_string()))
-                }
-                data.data = Data::String(chars.to_string());
-            }
-            Ok(DataCodeType::Float) => {
-                let mut floats: Vec<f64> = vec![];
-                for _j in 0..count {
-                    let float = buffer.f64();
-                    floats.push(float);
-                    if in_array {
-                        self.put(offset, Datum::Float(float));
-                    }
-                }
-                data.data = Data::Float(floats);
-            }
-            Ok(DataCodeType::Array) => {
-                let array_type = buffer.i32e("Unable to read array type");
-                if array_type < 0 {
-                    panic!("Invalid array type {array_type}");
-                }
-                let array_elements_count = buffer.i32e("Unable to read array elements count");
-                if array_elements_count < 0 {
-                    panic!("Invalid array elements count {}", array_elements_count)
-                }
-
-                if in_array {
-                    self.put(offset, Datum::Array(Data::Array(array_type, array_elements_count,VmArray::default())))
-                }
-                data.data = Data::Array(array_type, array_elements_count, VmArray::default());
-            }
-            Ok(DataCodeType::ArraySetIndex) => {
-                let array_index = buffer.i32e("Unable to read array base address");
-                if array_index < 0 {
-                    panic!("Invalid set array index {}", array_index);
-                }
-                self.set_index(array_index as usize, type_descs);
-                do_nothing = true;
-            }
-            Ok(DataCodeType::RestoreBase) => {
-                self.restore();
-                do_nothing = true;
-            }
-            Ok(DataCodeType::Integer64) => {
-                let mut integers: Vec<i64> = vec![];
-                for _j in 0..count {
-                    let big = buffer.i64e("Unable to read int64 datum");
-                    integers.push(big);
-                    if in_array {
-                        self.put(offset, Datum::Integer64(big))
-                    }
-                }
-                data.data = Data::Integer64(integers);
-            }
-            Err(err) => {
-                panic!("Invalid DataCode Type: {:?}", err.invalid_bytes)
-            }
-        }
-        /*println!("offset {}: {:?}",
-                 data.offset,
-                 &data.data);*/
-        if !do_nothing {
-            self.set(offset, data.data.clone());
-        }
-    }
-
-    pub fn write(&mut self, offset: usize, datum: Datum) {
-        match self.base {
-            Module(off) => {
-                let dest = (off + offset) as i32;
-                let d = self.map.get_mut(&dest).expect("offset should be valid");
-            }
-            Location::Array(arr) => {
-
-            }
-        }
-    }
-
-    pub fn put_new(&mut self, offset: usize, datum: Datum) {
-        let off = (offset as i32);
-        match datum {
-            Datum::Byte(b) => {
-                self.map.insert(off, Data::Byte(vec![b]));
-            }
-            Datum::Integer32(i) => {
-                self.map.insert(off, Data::Integer32(vec![i]));
-            }
-            Datum::String(s) => {
-                self.map.insert(off, Data::String(s));
-            }
-            Datum::Float(_) => {}
-            Datum::Array(data) => {
-                self.map.insert(off, data);
-            }
-            Datum::Integer64(_) => {}
-        };
-    }
-
-    pub fn put(&mut self, offset: usize, datum: Datum) {
-        let data = match self.base {
-            Module(_) => {
-                self.map.get_mut(&(offset as i32))
-            }
-            Location::Array(i) => {
-                self.map.get_mut(&(i as i32))
-            }
-        };
-
-        match data {
-            Some(Data::Array(_, _,ref mut v)) => {
-                //v.push(datum)
-                todo!("")
-            }
-            Some(Data::Byte(_)) => {
-
-            }
-            Some(Data::Integer32(v)) => {
-                let Datum::Integer32(i) = datum else {panic!("")};
-                v.push(i);
-            }
-           Some(Data::String(ref mut v)) => {
-                let Datum::String(s) = datum else {panic!("")};
-                *v = s;
-            }
-            Some(Data::Float(_)) => {
-
-            }
-
-            Some(Data::Integer64(_)) => {
-
-            }
-            None => {
-                self.put_new(offset, datum);
-            }
-        }
-    }
-
-    pub fn set(&mut self, offset: usize, data: Data) {
-        self.current = Module(offset);
-        self.map.insert(offset as i32, data);
-    }
-    pub fn get(&self, offset: usize) -> Option<&Data> {
-        self.map.get(&(offset as i32))
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        todo!()
     }
 }
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        unsafe {
+            //std::alloc::dealloc(self.heap.as_ptr(), self.layout);
+            libc::munmap(self.heap.as_ptr() as *mut libc::c_void, self.size);
+        }
+    }
+}*/
+//</editor-fold>

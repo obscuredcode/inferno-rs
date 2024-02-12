@@ -15,6 +15,7 @@ pub enum DisMagicNo {
 pub const XMAGIC: u32 = 819248; // unencrpted
 pub const SMAGIC: u32 = 923426; // encrypted
 
+#[allow(non_camel_case_types)]
 #[repr(u16)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Primitive)]
 pub enum DisRuntimeFlag {
