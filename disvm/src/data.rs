@@ -12,14 +12,16 @@ use util::BufferedReader;
 
 
 pub mod ctypes {
+    type Ptr = u32;
     const STRUCTALIGN: usize = 4;
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct String {
         pub(crate) len: i32,
         pub(crate) max: i32,
         pub(crate) _tmp: i32,
         // char*
-        pub(crate) data: [u8; STRUCTALIGN],
+        pub(crate) data: i32, // ptr
     }
 
     #[repr(C)]
@@ -30,7 +32,7 @@ pub mod ctypes {
         np: i32,
         _destroy: i32,
         _initialize: i32,
-        map: [u8; STRUCTALIGN]
+        map: i32 // ptr
     }
 }
 const PointerMap: i32 = 0x80;
@@ -136,6 +138,11 @@ impl Debug for Data {
         }
     }
 }
+impl Drop for Data {
+    fn drop(&mut self) {
+        // TODO: nothing for now
+    }
+}
 
 
 #[derive(Debug)]
@@ -160,6 +167,10 @@ impl From<LayoutError> for ModuleDataError {
     }
 }
 //</editor-fold>
+
+pub struct VmObject {
+
+}
 
 #[derive(Clone)]
 pub struct VmArray {
@@ -256,6 +267,13 @@ impl VmPtr {
     pub fn as_i32(&self) -> i32 {
         match self { VmPtr::Ptr(i) => {*i} }
     }
+    pub fn add(&mut self, a: usize) {
+        match self {
+            VmPtr::Ptr(i) => {
+                *i += a as i32;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -270,9 +288,7 @@ enum BasePtr {
 pub struct ModuleData {
     heap: NonNull<u8>,
     size: usize,
-    pub(crate) ptr_table: std::collections::HashMap<VmPtr, Data>,
     allocated: Vec<VmPtr>,
-    curr_ptr: i32,
     base: BasePtr,
     array_stack: Vec<BasePtr>,
     array_offset: usize,
@@ -307,9 +323,7 @@ impl ModuleData {
             Self {
                 heap: NonNull::new_unchecked(raw as *mut u8),
                 size,
-                ptr_table: Default::default(),
                 allocated: Default::default(),
-                curr_ptr: 0,
                 base: BasePtr::Module,
                 array_stack: Default::default(),
                 array_offset: 0,
@@ -350,32 +364,65 @@ impl ModuleData {
         }
     }
 
-    pub fn allocate(&mut self) -> VmPtr {
-        let ptr = VmPtr::Ptr(self.curr_ptr);
-        self.curr_ptr += 1;
-        self.allocated.push(ptr);
+
+    pub fn allocate_bytes(&mut self, n: usize) -> VmPtr {
+        let raw = unsafe { self.heap.as_ptr().add(self.heap_start) } ;
+        let ptr = VmPtr::Ptr(raw as i32);
+        let mut size = n;
+        if (size % 4 != 0) {
+            size = (size/4 + 1) * 4;
+        }
+        self.heap_start += size;
         ptr
     }
-    pub fn read_ptr(&self, ptr: &VmPtr) -> Option<&Data> {
-        let mut data: Option::<&Data> = None;
 
-        if (ptr.as_i32() != - 1) {
-            data = self.ptr_table.get(&ptr)
-        };
-
-        data
+    pub fn allocate<T>(&mut self, t: T) -> VmPtr {
+        let raw = unsafe { self.heap.as_ptr().add(self.heap_start) };
+        let ptr = VmPtr::Ptr(raw as i32);
+        let mut size = std::mem::size_of::<T>();
+        if (size % 4 != 0) {
+            size = (size/4 + 1) * 4;
+        }
+        self.heap_start += size;
+        ptr
     }
+
+    pub fn write_ptr<T>(&mut self, t: T, a: VmPtr) {
+       unsafe {
+           let VmPtr::Ptr(p) = a;
+           let raw = p as *mut T;
+           std::ptr::write::<T>(raw, t);
+       }
+    }
+
+    pub fn read_ptr<T>(&self, a: VmPtr) -> T {
+        unsafe {
+            let VmPtr::Ptr(p) = a;
+            std::ptr::read::<T>(p as *const T)
+        }
+    }
+
+    pub fn read_ptr_bytes<T>(&self, a: VmPtr, n: usize) -> &[T] {
+        unsafe {
+            let VmPtr::Ptr(p) = a;
+            &*std::ptr::slice_from_raw_parts(p as *const T, n)
+        }
+    }
+
     pub fn write<T: Debug>(&mut self, src: T, offset: usize) {
         match self.base {
             BasePtr::Module => {
                 self.write_offset(src, offset);
             }
             BasePtr::Array { ptr, start_index } => {
-                let Data::Array(t, c, v) =
-                    self.ptr_table.get_mut(&ptr).unwrap() else {panic!("")};
+
+                /*let Data::Array(t, c, v) =
+                    self.ptr_table.get_mut(&ptr).unwrap() else {panic!("")};*/
+
+                todo!("implement array");
                 let dest = offset + self.array_offset;
                 let size = std::mem::size_of_val(&src);
-                v.write(src, dest);
+                //v.write(src, dest);
 
                 //println!("writing {:?} at {} to {:?}", src, dest, v);
                 self.array_offset += size;
@@ -389,9 +436,18 @@ impl ModuleData {
     }
 
 
-    pub fn get(&self, offset: usize) -> Option<&Data> {
+    pub fn get(&self, offset: usize) -> Option<VmObject> {
         let ptr: VmPtr = VmPtr::Ptr(self.read::<i32>(offset));
-        self.read_ptr(&ptr)
+        if ptr.as_i32() == -1 {
+            return None;
+        }
+        let raw = unsafe {ptr.as_i32() as *const ctypes::String};
+        let cstr =self.read_ptr::<ctypes::String>(ptr);
+        let str = unsafe {
+            let b = cstr.data as *const u8;
+            String::from_utf8_lossy(&*std::ptr::slice_from_raw_parts(b, cstr.len as usize)).to_string()
+        };
+        Some(Data::String(str))
     }
 
     pub fn set_index(&mut self, array_index: usize) {
@@ -415,8 +471,32 @@ impl ModuleData {
         self.base = new;
     }
     pub fn write_data(&mut self, data: Data, offset: usize) -> VmPtr {
-        let ptr = self.allocate();
-        self.ptr_table.insert(ptr, data);
+        let mut str: &String = &String::new();
+        match data {
+            Data::String(ref s) => {
+                str = s;
+            }
+            _ => {}
+        };
+
+        let count = str.len();
+        let str_data = self.allocate_bytes(count);
+        let mut i = str_data;
+        for b in str.bytes() {
+            self.write_ptr(b, i);
+            i.add(1);
+        }
+
+
+        let cstr = ctypes::String {
+            len: count as i32,
+            max: count as i32,
+            _tmp: 0,
+            data: str_data.as_i32(),
+        };
+
+        let ptr = self.allocate(cstr);
+        self.write_ptr(cstr, ptr);
         self.write(ptr.as_i32(), offset);
         ptr
     }
@@ -450,6 +530,7 @@ impl ModuleData {
             }
             Ok(DataCodeType::StringUTF) => {
                 let chars = String::from_utf8_lossy(buffer.reade(count, "Unable to read utf8 string"));
+                println!("{}", chars.to_string());
                 let data = Data::String(chars.to_string());
                 let ptr = self.write_data(data, offset);
                 //println!("wrote str {:?} ptr {:?} at offset {}", chars, ptr, offset);
