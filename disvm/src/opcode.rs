@@ -1,7 +1,7 @@
-#![allow(non_camel_case_types, dead_code)]
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[rustfmt::skip]
 pub enum Opcode {
     INOP,
     IALT,
@@ -186,7 +186,7 @@ impl Opcode {
     }
 }
 
-const INSTR_MNEMONICS: &[&str] = &[
+pub const INSTR_MNEMONICS: &[&str] = &[
     "nop",
     "alt",
     "nbalt",

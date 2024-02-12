@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 
-
-
 // magic signatures for dis modules.
 
 #[repr(u32)]

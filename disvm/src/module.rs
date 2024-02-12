@@ -1,55 +1,23 @@
+use data::VmPtr;
+use std::alloc::Layout;
+use std::cell::RefCell;
+use std::convert::TryInto;
 use std::error::Error;
-use std::fmt::{Debug, Formatter};
+use std::ffi::CStr;
+use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::io::Read;
-use modular_bitfield::prelude::*;
-use crate::disvm::consts::*;
-
+use std::mem::size_of_val;
+use std::rc::Rc;
 use num_traits::{FromPrimitive, ToPrimitive};
-use crate::disvm::opcode::Opcode;
+use modular_bitfield::prelude::*;
+use presser::{copy_from_slice_to_offset, copy_to_offset, Slab};
+use consts::*;
 
-#[derive(Debug)]
-pub enum ModuleParserError {
-    InvalidMagic(u32),
-    MalformedOperand(Operand,[u8; 4]),
-    UnrecognizedOpcode(u8),
-    UnrecognizedOperandData(Operand, SourceDestOpMode),
-    MalformedHeader(String),
-    SliceError(usize),
-    IOError(std::io::Error)
-}
-
-impl std::fmt::Display for ModuleParserError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-       match *self {
-           ModuleParserError::InvalidMagic(magic) =>
-               write!(f, "The magic number {} is not recognized as either XMAGIC or SMAGIC", magic),
-           ModuleParserError::MalformedOperand(operand, bytes) =>
-               write!(f, "The bytes {:?} are not enough for operand of size {}", bytes, operand.size()),
-           ModuleParserError::UnrecognizedOpcode(op) => write!(f, "Invalid Opcode {:x}", op),
-           ModuleParserError::SliceError(off) => write!(f, "Not enough bytes for slice at offset {}", off),
-           ModuleParserError::UnrecognizedOperandData(operand, mode) =>
-               write!(f, "Unable to handle addressing mode {:?} for data {:?}", mode, operand),
-           ModuleParserError::MalformedHeader(ref err) => write!(f, "{}", err),
-           ModuleParserError::IOError(ref err) => std::fmt::Display::fmt(&err, f)
-       }
-    }
-}
-
-impl Error for ModuleParserError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match *self {
-            ModuleParserError::InvalidMagic(_) => None,
-            ModuleParserError::MalformedOperand(_,_) => None,
-            ModuleParserError::UnrecognizedOpcode(_) => None,
-            ModuleParserError::UnrecognizedOperandData(_, _) => None,
-            ModuleParserError::SliceError(_) => None,
-            ModuleParserError::MalformedHeader(_) => None,
-            ModuleParserError::IOError(ref err) => Some(err)
-        }
-    }
-}
-
+use opcode::{INSTR_MNEMONICS, Opcode};
+use data;
+use data::{Data, DataCodeType, Heap, ModuleGlobalData, DataCode};
+use util::BufferedReader;
 
 #[derive(BitfieldSpecifier, Debug, Eq, PartialEq, Copy, Clone)]
 #[bits=2]
@@ -77,9 +45,9 @@ pub enum SourceDestOpMode {
 #[bitfield(bits=8)]
 pub struct OpAddressMode {
     #[bits=3]
-    source_op_mode: SourceDestOpMode,
-    #[bits=3]
     dest_op_mode: SourceDestOpMode,
+    #[bits=3]
+    source_op_mode: SourceDestOpMode,
     #[bits=2]
     middle_op_mode: MiddleOpMode
 }
@@ -99,6 +67,23 @@ pub enum MiddleOperandData {
     None
 }
 
+impl Display for MiddleOperandData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            MiddleOperandData::SmallImmediate(i) => {
+                write!(f, "${}", i)
+            }
+            MiddleOperandData::IndirectFP(o) => {
+                write!(f, "{}(fp)", o)
+            }
+            MiddleOperandData::IndirectMP(o) => {
+                write!(f, "{}(mp)", o)
+            }
+            MiddleOperandData::None => {Ok(())}
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum SourceDestOperandData {
     Immediate(i32),
@@ -109,13 +94,36 @@ pub enum SourceDestOperandData {
     None
 }
 
-//#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+impl Display for SourceDestOperandData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            SourceDestOperandData::Immediate(i) => {
+                write!(f, "${}", i)
+            }
+            SourceDestOperandData::IndirectMP(ind) => {
+                write!(f, "${}(mp)", ind)
+            }
+            SourceDestOperandData::IndirectFP(ind) => {
+                write!(f, "${}(fp)", ind)
+            }
+            SourceDestOperandData::DoubleIndirectMP(ind1, ind2) => {
+                write!(f, "${}({}(mp))", ind2, ind1)
+            }
+            SourceDestOperandData::DoubleIndirectFP(ind1, ind2) => {
+                write!(f, "${}({}(fp))", ind2, ind1)
+            }
+            SourceDestOperandData::None => {Ok(())}
+        }
+    }
+}
+
+
 pub struct Instruction {
-    opcode: Opcode,
-    address: OpAddressMode,
-    middle_data:MiddleOperandData,
-    src_data: SourceDestOperandData,
-    dest_data: SourceDestOperandData
+    pub(crate) opcode: Opcode,
+    pub(crate) address: OpAddressMode,
+    pub(crate) middle_data:MiddleOperandData,
+    pub(crate) src_data: SourceDestOperandData,
+    pub(crate) dest_data: SourceDestOperandData
 }
 
 impl Instruction {
@@ -134,6 +142,23 @@ impl Debug for Instruction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "Instruction {{op: {:?}, {:?}, middle_data {:x?}, src_data {:x?}, dest_data {:x?} }}",
                self.opcode, self.address, self.middle_data, self.src_data, self.dest_data)
+    }
+}
+
+impl Display for Instruction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ", INSTR_MNEMONICS[self.opcode as usize])?;
+        if self.middle_data == MiddleOperandData::None {
+            if self.src_data == SourceDestOperandData::None {
+                write!(f, "{}", self.dest_data)
+            } else if self.dest_data == SourceDestOperandData::None {
+                write!(f, "{}", self.src_data)
+            } else {
+                write!(f, "{}, {}", self.src_data, self.dest_data)
+            }
+        } else {
+            write!(f, "{}, {}, {}", self.src_data, self.middle_data, self.dest_data)
+        }
     }
 }
 
@@ -175,7 +200,10 @@ impl Operand {
         match self {
             Operand::Byte(val) => {val as i16}
             Operand::Short(val) => {val as i16}
-            Operand::Word(_) => {panic!("Operand not word")}
+            Operand::Word(val) => {
+                println!("Operand {:?} not word", self);
+                val as i16
+            }
         }
     }
 
@@ -205,10 +233,12 @@ impl Operand {
     }
 }
 
-//#[derive(Debug)]
+#[derive(Default, PartialEq, Eq, Clone)]
 pub struct TypeMap {
-    bytes: Vec<u8>
+    pub bytes: Vec<u8>
 }
+
+
 
 impl Debug for TypeMap {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -220,12 +250,12 @@ impl Debug for TypeMap {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Type {
-    desc_no: i32,
-    size: i32,
-    map_size: i32,
-    map: TypeMap
+    pub(crate) desc_no: i32,
+    pub(crate) size: i32,
+    pub(crate) map_size: i32,
+    pub(crate) map: TypeMap
 }
 
 impl Type {
@@ -237,62 +267,30 @@ impl Type {
             map: TypeMap { bytes: vec![] },
         }
     }
-}
 
+    pub fn is_pointer(&self, offset: usize) -> bool {
+        let byte_index = offset/32;
 
+        let bit_index = 7 - (offset % 32)/4;
 
-#[derive(BitfieldSpecifier, Debug, PartialEq, Eq, Copy, Clone)]
-#[bits=4]
-pub enum DataCodeType {
-    Byte          = 0b0001,
-    Integer32     = 0b0010,
-    StringUTF     = 0b0011,
-    Float         = 0b0100,
-    Array         = 0b0101,
-    ArraySetIndex = 0b0110,
-    RestoreBase   = 0b0111,
-    Integer64     = 0b1000,
-}
+        if (byte_index < self.map_size as usize) {
+            let byte_map = self.map.bytes[(self.map_size as usize - byte_index) - 1];
+            // lowest offset is mapped to highest bit
 
-#[bitfield(bits=8)]
-pub struct DataCode {
-    #[bits=4]
-    count: B4,
-    #[bits=4]
-    data_type: DataCodeType,
-}
-
-impl Debug for DataCode {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self.data_type_or_err() {
-            Ok(dt) => {
-                write!(f, "DataCode {{ size: {}, type: {:?} }}", self.count(), dt)
-            }
-            Err(bit) => {
-                write!(f, "DataCode {{ size: {}, unrecognized type: {:?} }}", self.count(), bit.invalid_bytes)
-            }
+            return (byte_map >> bit_index) & 0x01 == 0x01;
         }
+        return false;
     }
 }
 
-#[derive(Debug)]
-pub enum Data {
-    Byte(Vec<u8>),
-    Integer32(Vec<i32>),
-    String(String),
-    Float(Vec<f64>),
-    Array(i32, i32),
-    ArraySetIndex(i32),
-    RestoreBase(),
-    Integer64(Vec<i64>),
-}
+
 
 #[derive(Debug)]
 pub struct DataSection {
-    code: DataCode,
-    countopt: Option<i32>,
-    offset: i32,
-    data: Data
+    pub code: DataCode,
+    pub(crate) countopt: Option<i32>,
+    pub(crate) offset: i32,
+    pub(crate) data: Data
 }
 
 impl DataSection {
@@ -308,10 +306,10 @@ impl DataSection {
 
 #[derive(Debug)]
 pub struct Export {
-    entry_pc: i32,
-    desc: i32,
-    sig: i32,
-    fn_name: String
+    pub(crate) entry_pc: i32,
+    pub(crate) desc: i32,
+    pub(crate) sig: i32,
+    pub(crate) fn_name: String
 }
 
 impl Export {
@@ -327,8 +325,8 @@ impl Export {
 
 #[derive(Debug)]
 pub struct Import {
-    sig: i32,
-    fn_name: String
+    pub(crate) sig: i32,
+    pub(crate) fn_name: String
 }
 
 impl Import {
@@ -342,7 +340,7 @@ impl Import {
 
 #[derive(Debug)]
 pub struct ModuleImport {
-    imports: Vec<Import>
+    pub(crate) imports: Vec<Import>
 }
 
 impl ModuleImport {
@@ -355,8 +353,8 @@ impl ModuleImport {
 
 #[derive(Debug)]
 pub struct ExceptionHandler {
-    name: String,
-    pc: i32
+    pub(crate) name: String,
+    pub(crate) pc: i32
 }
 
 impl ExceptionHandler {
@@ -371,13 +369,13 @@ impl ExceptionHandler {
 
 #[derive(Debug)]
 pub struct HandlerSection {
-    frame_offset: i32,
-    pc_start: i32,
-    pc_end: i32,
-    type_desc: i32,
+    pub(crate) frame_offset: i32,
+    pub(crate) pc_start: i32,
+    pub(crate) pc_end: i32,
+    pub(crate) type_desc: i32,
     no_exceptions: i32,
     exceptions: Vec<ExceptionHandler>,
-    default_pc: i32
+    pub(crate) default_pc: i32
 }
 
 impl HandlerSection {
@@ -393,6 +391,50 @@ impl HandlerSection {
         }
     }
 }
+
+
+#[derive(Debug)]
+pub enum ModuleParserError {
+    InvalidMagic(u32),
+    MalformedOperand(Operand,[u8; 4]),
+    UnrecognizedOpcode(u8),
+    UnrecognizedOperandData(Operand, SourceDestOpMode),
+    MalformedHeader(String),
+    SliceError(usize),
+    IOError(std::io::Error)
+}
+
+impl Display for ModuleParserError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ModuleParserError::InvalidMagic(magic) =>
+                write!(f, "The magic number {} is not recognized as either XMAGIC or SMAGIC", magic),
+            ModuleParserError::MalformedOperand(operand, bytes) =>
+                write!(f, "The bytes {:?} are not enough for operand of size {}", bytes, operand.size()),
+            ModuleParserError::UnrecognizedOpcode(op) => write!(f, "Invalid Opcode {:x}", op),
+            ModuleParserError::SliceError(off) => write!(f, "Not enough bytes for slice at offset {}", off),
+            ModuleParserError::UnrecognizedOperandData(operand, mode) =>
+                write!(f, "Unable to handle addressing mode {:?} for data {:?}", mode, operand),
+            ModuleParserError::MalformedHeader(ref err) => write!(f, "{}", err),
+            ModuleParserError::IOError(ref err) => std::fmt::Display::fmt(&err, f)
+        }
+    }
+}
+
+impl Error for ModuleParserError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match *self {
+            ModuleParserError::InvalidMagic(_) => None,
+            ModuleParserError::MalformedOperand(_,_) => None,
+            ModuleParserError::UnrecognizedOpcode(_) => None,
+            ModuleParserError::UnrecognizedOperandData(_, _) => None,
+            ModuleParserError::SliceError(_) => None,
+            ModuleParserError::MalformedHeader(_) => None,
+            ModuleParserError::IOError(ref err) => Some(err)
+        }
+    }
+}
+
 
 pub fn parse_operand(buffer: &[u8]) -> Operand {
     let operand_size = buffer[0] & 0xC0;
@@ -440,26 +482,29 @@ pub fn parse_word(bytes: &[u8]) -> i32 {
 }
 
 
+pub const MODULE_TYPE_DESC: i32 = 0;
+pub const ARRAY_PARSER_STACK: usize = 10;
+
 #[derive(Debug)]
 pub struct DisModule {
     magic: DisMagicNo,
     signature: Option<Vec<u8>>,
-    runtime_flag: DisRuntimeFlag,
-    stack_extent: i32,
+    pub runtime_flag: DisRuntimeFlag,
+    pub stack_extent: i32,
     code_size: i32,
     data_size: i32,
     type_size: i32,
     link_size: i32,
-    entry_pc: i32,
-    entry_type: i32,
-    code: Vec<Instruction>,
-    types: Vec<Type>,
-    data: Vec<DataSection>,
-    module_name: String,
-    exports: Vec<Export>,
-    imports: Vec<ModuleImport>,
-    handlers: HandlerSection,
-    module_src_path: String
+    pub entry_pc: i32,
+    pub entry_type: i32,
+    pub code: Vec<Instruction>,
+    pub types: Vec<Type>,
+    pub data: Vec<DataSection>,
+    pub module_name: String,
+    pub exports: Vec<Export>,
+    pub imports: Vec<ModuleImport>,
+    pub handlers: HandlerSection,
+    pub module_src_path: String
 }
 
 impl DisModule {
@@ -487,12 +532,14 @@ impl DisModule {
     }
 }
 
-pub fn load_module(name: &str) -> Result<(), std::io::Error> {
+pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
 
     let mut file = File::open(&name)?;
 
     let mut buffer = Vec::new();
     let mut offset = 0;
+
+
 
     let mut dis = DisModule::new();
 
@@ -571,6 +618,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
 
     for _i in 0..code_size.into_usize() {
         // read single instruction
+        let mut ins_start = offset;
         let mut ins = Instruction::new();
         let opadr = buffer.get(offset..offset+2).expect("Unable to read opcode and addressing mode");
         ins.opcode = Opcode::from_u8(opadr[0]);
@@ -628,6 +676,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                 }
             }
         }
+        let s = ins.address.bytes[0] & 0x07;
 
         if ins.address.dest_op_mode() != SourceDestOpMode::None {
             let data = parse_operand(buffer.get(offset..offset+4).expect("Unable to read dest operand data"));
@@ -659,9 +708,8 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
             }
         }
 
-        //println!("Instruction {} is {:?}", _i, ins);
         dis.code.push(ins);
-
+        //println!("Ins {} is {:x?}", _i, buffer.get(ins_start..offset).unwrap());
     }
 
     // read type descriptors
@@ -690,41 +738,96 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
         dis.types.push(type_desc);
     }
 
-    // read data
+    // find module type descriptor
 
+    for desc in &dis.types {
+        if desc.desc_no == MODULE_TYPE_DESC {
+            //println!("{:#?}", desc);
+            println!("Module Type Descriptor: ");
+            if (desc.size != dis.data_size) {
+                panic!("Module type descriptor invalid");
+            }
+        }
+        //println!("{:#?}", desc);
+    }
+
+    let mut md = Heap::new(&dis.types[0]);
+
+    let buffer_copy = buffer.clone();
+
+    let mut reader = Rc::new(RefCell::new(BufferedReader {
+        buffer: &buffer_copy,
+        offset: offset,
+        error: "".to_string()
+    }));
+
+
+    // read data
     // setup array parsing stack
+    let mut array_stack: Vec<usize> = Vec::with_capacity(ARRAY_PARSER_STACK);
     // setup base data address
+    let data_size = dis.data_size as usize;
+
+    let mut module_data_vec: Vec<u8> = Vec::with_capacity(data_size);
+    //module_data_vec.fill(0);
+    for _i in 0..data_size {
+        module_data_vec.push(0);
+    }
+
+   // let mut m = unsafe { ModuleData::new(dis.types[0].clone()) }.unwrap();
+    /*let s = runtime::ctypes::String {
+        len: 1,
+        max: 2,
+        _tmp: 3,
+        data: [4, 5, 6, 7],
+    };
+    m.write_offset(s, 0);*/
+
+    let mut m = ModuleGlobalData::new();
+
     let mut base_address: usize = 0;
+
     let mut i = 0;
     'data: loop {
-
-
         let mut data = DataSection::new();
+        let mut count = 0;
+        let mut code = DataCode::from_bytes([0]);
+        {
+            let mut  r = reader.borrow_mut();
+            code = DataCode::from_bytes([r.u8()]);
 
-        let code = DataCode::from_bytes([buffer.get(offset..offset+1).
-                                                                expect("Unable to read data code")[0]]);
+            ;/*DataCode::from_bytes([buffer.get(offset..offset+1).
+                                                                expect("Unable to read data code")[0]]);*/
+            //offset += 1;
 
-        offset += 1;
-        
-        if code.bytes[0] == 0 {
-            break 'data;
+            if code.is_zero() {
+                break 'data;
+            }
+
+
+            count = code.get_count() as i32;
+            if count == 0 {
+                let countopt = r.operand(); //parse_operand(buffer.get(offset..offset+4).expect("Unable to read data countop"));
+                //offset += countopt.size();
+                count = countopt.into_i32();
+                data.countopt = Some(count)
+            }
+
+            if count < 0 {
+                panic!("Invalid data count {count}");
+            }
+
+           // let data_offset = r.operand(); //parse_operand(buffer.get(offset..offset+4).expect("Unable to read data offset"));
+            //offset += data_offset.size();
+
+
+            //let mut dest_address = base_address + data_offset.into_usize();
+            //data.offset = dest_address as i32; //data_offset.into_i32();
+            //data.code = code;
         }
-
-        let mut count = code.count() as i32;
-        if count == 0 {
-            let countopt = parse_operand(buffer.get(offset..offset+4).expect("Unable to read data countop"));
-            offset += countopt.size();
-            count = countopt.into_i32();
-            data.countopt = Some(count)
-        }
-
-        let data_offset = parse_operand(buffer.get(offset..offset+4).expect("Unable to read data offset"));
-        offset += data_offset.size();
-        data.offset = data_offset.into_i32();
-
-        let mut dest_address = base_address + data_offset.into_usize();
-
-        match code.data_type_or_err() {
+        //m.load_data(count as usize, &mut data, &dis.types, reader.clone());
+        md.load_data(code, count as usize, &dis.types, reader.clone());
+        /*match code.data_type_or_err() {
             Ok(DataCodeType::Byte) => {
                 //println!("Found {} bytes", count);
                 let mut bytes: Vec<u8> = vec![];
@@ -732,11 +835,16 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                     let byte = buffer.get(offset..offset+1).expect("Unable to read data byte")[0];
                     offset += 1;
                     // read into dest_address
-                    dest_address += 1;
-
+                    //copy_to_offset(&byte, &mut slab, dest_address);
                     bytes.push(byte);
                 }
                 data.data = Data::Byte(bytes);
+                println!("offset {}, wanted: {}: {:?}",
+                         data.offset,
+                         data_offset.into_usize(),
+                        &data.data);
+                m.set(dest_address, data.data);
+                dest_address += 4;
             }
             Ok(DataCodeType::Integer32) => {
                 //println!("Found {} integers", count);
@@ -745,10 +853,17 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                     let word = parse_word(buffer.get(offset..offset+4).expect("Unable to read data int32"));
                     offset += 4;
                     // read into dest_address
-                    dest_address += 1;
+                    //copy_to_offset(&word, &mut slab, dest_address);
                     integers.push(word);
                 }
+
                 data.data = Data::Integer32(integers);
+                println!("offset {}, wanted: {}: {:?}",
+                         data.offset,
+                         data_offset.into_usize(),
+                         &data.data);
+                m.set(dest_address, data.data);
+                dest_address += 4;
             }
             Ok(DataCodeType::StringUTF) => {
                 //let mut chars: String = String::with_capacity(count as usize);
@@ -758,6 +873,13 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                 //println!("string {} is {}", _i, chars);
                 offset += count as usize;
                 data.data = Data::String(chars.to_string());
+                //copy_from_slice_to_offset(chars.as_bytes(), &mut slab, dest_address);
+                println!("offset {}, wanted: {}: {:?}",
+                         data.offset,
+                         data_offset.into_usize(),
+                         &data.data);
+                m.set(dest_address, data.data);
+                dest_address += 4;
             }
             Ok(DataCodeType::Float) => {
                 //println!("found {} floats", count);
@@ -769,6 +891,9 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                     offset += 8;
                     floats.push(float);
                 }
+                data.data = Data::Float(floats);
+                m.set(dest_address, data.data);
+                dest_address += 4;
             }
             Ok(DataCodeType::Array) => {
                 let array_type = parse_word(buffer.get(offset..offset+4).expect("Unable to read array type"));
@@ -780,7 +905,13 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                 let array_elements_count = parse_word(buffer.get(offset..offset+4).expect("Unable to read array elements count"));
                 offset += 4;
 
-
+                data.data = Data::Array(array_type, array_elements_count, vec![]);
+                println!("offset {}, wanted: {}: {:?}",
+                         data.offset,
+                         data_offset.into_usize(),
+                         &data.data);
+                m.set(dest_address, data.data);
+                dest_address += 4;
             }
             Ok(DataCodeType::ArraySetIndex) => {
                 let array_index = parse_word(buffer.get(offset..offset+4).expect("Unable to read array base address"));
@@ -790,13 +921,28 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                     // invalid index
                 }
                 // the current dest_address should refer to an array
-
+                let arr = m.get(dest_address);
+                match &arr {
+                    Data::Array(t, c, _) => {
+                        let typ = &dis.types[*t as usize];
+                        println!("array typ: {:?}, count: {}", typ, *c);
+                    }
+                    _ => {
+                        panic!("set index isn't following array")
+                    }
+                }
                 // push current base address
+                array_stack.push(base_address);
                 // load new base address from array_index
+                //base_address = array_index as usize + 4;
+                m.set_index(array_index as usize, base_address, &dis.types);
 
             }
             Ok(DataCodeType::RestoreBase) => {
                 // pop current base address
+                let new = array_stack.pop().expect("Attempted to restore array base address when none was saved");
+                println!("restored base from {} to {}", base_address, new);
+                base_address = new;
             }
             Ok(DataCodeType::Integer64) => {
                // println!("found {} int64s", count);
@@ -810,14 +956,50 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
                     integers.push(big);
                 }
                 data.data = Data::Integer64(integers);
+                m.set(dest_address, data.data);
+                dest_address += 4;
             }
             Err(bits) => {
                panic!("Invalid data code bytes {}", bits.invalid_bytes);
             }
-        }
-        dis.data.push(data);
+        }*/
+
+
+        //dis.data.push(data);
         i += 1;
     }
+
+    offset = reader.borrow().offset;
+    let mut op = 0;
+    for i in &dis.code {
+        match i.src_data {
+            SourceDestOperandData::Immediate(_) => {}
+            SourceDestOperandData::IndirectMP(o) => {
+                let d = md.get(o as usize);
+                match d {
+                    Some(data) => {
+                        println!("\nsrc is {:?}", data);
+                    }
+                    _ => {
+
+                    }
+                }
+
+            }
+            SourceDestOperandData::IndirectFP(_) => {}
+            SourceDestOperandData::DoubleIndirectMP(_, _) => {}
+            SourceDestOperandData::DoubleIndirectFP(_, _) => {}
+            SourceDestOperandData::None => {}
+        }
+        println!("{}: {}", op, i);
+        op += 1;
+    }
+
+    //println!("{:#?}", m);
+    /*unsafe {
+        let s = CStr::from_ptr(slab.base_ptr().add(4) as *const i8);
+        println!("{:?}", s)
+    }*/
 
     // read module name
 
@@ -960,7 +1142,7 @@ pub fn load_module(name: &str) -> Result<(), std::io::Error> {
 
     //println!("{}", dis.module_src_path);
 
-    println!("Module {:#?}", dis);
+    //println!("Module {:#?}", dis);
 
-    Ok(())
+    Ok(dis)
 }

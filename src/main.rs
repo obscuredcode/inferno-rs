@@ -1,12 +1,14 @@
-#[macro_use]
-extern crate enum_primitive_derive;
-extern crate num_traits;
-extern crate modular_bitfield;
+extern crate disvm;
 
-mod disvm;
+use disvm::module::load_module;
+use disvm::module::DisModule;
 
-use crate::disvm::module::load_module;
-
-fn main() {
-    load_module("./doc/inferno-os/dis/echo.dis").unwrap();
+fn main() { // xd
+    let m = load_module("./doc/inferno-os/dis/xd.dis").unwrap();
+    let mut pc = 0;
+    for i in &m.code {
+       //println!("{pc}: {}", i);
+        pc += 1;
+    }
+    //println!("{:#?}", m);
 }
