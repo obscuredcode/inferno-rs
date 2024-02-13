@@ -1,4 +1,4 @@
-use data::VmPtr;
+use mem::VmPtr;
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
@@ -10,7 +10,7 @@ use modular_bitfield::prelude::*;
 use consts::*;
 
 use opcode::{INSTR_MNEMONICS, Opcode};
-use data::{Data, DataCodeType, ModuleData, DataCode};
+use mem::{Data, DataCodeType, ModuleData, DataCode};
 use util::BufferedReader;
 
 #[derive(BitfieldSpecifier, Debug, Eq, PartialEq, Copy, Clone)]
@@ -35,7 +35,7 @@ pub enum SourceDestOpMode {
     Reserved2       =0b111  //
 }
 
-//#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+//#[derive(Eq, PartialEq)]
 #[bitfield(bits=8)]
 pub struct OpAddressMode {
     #[bits=3]
@@ -52,6 +52,14 @@ impl Debug for OpAddressMode {
                self.middle_op_mode(), self.source_op_mode(), self.dest_op_mode())
     }
 }
+
+
+impl Clone for OpAddressMode {
+    fn clone(&self) -> Self {
+        OpAddressMode::from_bytes(self.bytes)
+    }
+}
+
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum MiddleOperandData {
@@ -112,6 +120,7 @@ impl Display for SourceDestOperandData {
 }
 
 
+#[derive(Clone)]
 pub struct Instruction {
     pub(crate) opcode: Opcode,
     pub(crate) address: OpAddressMode,
@@ -782,14 +791,14 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
 
     offset = reader.borrow().offset;
     let mut op = 0;
-    for i in &dis.code {
+    /*for i in &dis.code {
         match i.src_data {
             SourceDestOperandData::Immediate(_) => {}
             SourceDestOperandData::IndirectMP(o) => {
-                let d = md.get(o as usize);
+                //let d = md.get(o as usize);
                 match d {
                     Some(data) => {
-                        println!("\nsrc is {:?}", data);
+                       // println!("\nsrc is {:?}", data);
                     }
                     _ => {
 
@@ -804,7 +813,7 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
         }
         println!("{}: {}", op, i);
         op += 1;
-    }
+    }*/
 
 
     // read module name

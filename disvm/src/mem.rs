@@ -447,7 +447,7 @@ impl ModuleData {
             let b = cstr.data as *const u8;
             String::from_utf8_lossy(&*std::ptr::slice_from_raw_parts(b, cstr.len as usize)).to_string()
         };
-        Some(Data::String(str))
+        Some(VmObject {})
     }
 
     pub fn set_index(&mut self, array_index: usize) {
