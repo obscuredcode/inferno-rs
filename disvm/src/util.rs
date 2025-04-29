@@ -10,7 +10,7 @@ impl<'a> BufferedReader<'a> {
 
     pub fn peek(&self, n: usize) -> &'a [u8] {
         self.buffer.get(self.offset..self.offset + n).unwrap_or_else(move || {
-            panic!("failed to read {n} bytes at offset {self.offset} for {self.error}")
+            panic!("failed to read {} bytes at offset {} for {}", n, self.offset, self.error)
         })
     }
     pub fn read(&mut self, n: usize) -> &[u8] {

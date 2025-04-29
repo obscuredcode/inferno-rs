@@ -1,5 +1,5 @@
-use mem::VmPtr;
-use std::cell::RefCell;
+use mem::{vm_types, VmPtr};
+use std::cell::{Cell, LazyCell, RefCell};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
@@ -8,42 +8,55 @@ use std::rc::Rc;
 use num_traits::{FromPrimitive, ToPrimitive};
 use modular_bitfield::prelude::*;
 use consts::*;
+use mem;
 
 use opcode::{INSTR_MNEMONICS, Opcode};
-use mem::{Data, DataCodeType, ModuleData, DataCode};
+use mem::{ModuleHeap, Data};
 use util::BufferedReader;
 
 #[derive(BitfieldSpecifier, Debug, Eq, PartialEq, Copy, Clone)]
 #[bits=2]
 pub enum MiddleOpMode {
-    None             =0b00, // none   | no middle operand
-    SmallImmediate   =0b01, // $SI    | small immediate
-    SmallOffsetIndFP =0b10, // SO(FP) | small offset indirect from FP
-    SmallOffsetIndMP =0b11  // SO(MP) | small offset indirect from MP
+    None             =0b00, // none   | no middle operand             | AXNON
+    SmallImmediate   =0b01, // $SI    | small immediate               | AXIMM
+    SmallOffsetIndFP =0b10, // SO(FP) | small offset indirect from FP | AXINF
+    SmallOffsetIndMP =0b11  // SO(MP) | small offset indirect from MP | AXINM
+}
+
+impl Default for MiddleOpMode {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 #[derive(BitfieldSpecifier, Debug, Eq, PartialEq, Copy, Clone)]
 #[bits=3]
 pub enum SourceDestOpMode {
-    OffsetIndMP     =0b000, // LO(MP)     | offset indirect from MP
-    OffsetIndFP     =0b001, // LO(FP)     | offset indirect from FP
-    WordImmediate   =0b010, // $OP        | 30 bit immediate
-    None            =0b011, // none       | no operand
-    DoubleIndMP     =0b100, // SO(SO(MP)) | double indirect from MP
-    DoubleIndFP     =0b101, // SO(SO(FP)) | double indirect from FP
+    OffsetIndMP     =0b000, // LO(MP)     | offset indirect from MP | AMP
+    OffsetIndFP     =0b001, // LO(FP)     | offset indirect from FP | AFP
+    WordImmediate   =0b010, // $OP        | 30 bit immediate        | AIMM
+    None            =0b011, // none       | no operand              | AXXX
+    DoubleIndMP     =0b100, // SO(SO(MP)) | double indirect from MP | AIND+AMP
+    DoubleIndFP     =0b101, // SO(SO(FP)) | double indirect from FP | AIND+AFP
     Reserved1       =0b110, //
     Reserved2       =0b111  //
+}
+
+impl Default for SourceDestOpMode {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 //#[derive(Eq, PartialEq)]
 #[bitfield(bits=8)]
 pub struct OpAddressMode {
     #[bits=3]
-    dest_op_mode: SourceDestOpMode,
+    pub dest_op_mode: SourceDestOpMode,
     #[bits=3]
-    source_op_mode: SourceDestOpMode,
+    pub source_op_mode: SourceDestOpMode,
     #[bits=2]
-    middle_op_mode: MiddleOpMode
+    pub middle_op_mode: MiddleOpMode
 }
 
 impl Debug for OpAddressMode {
@@ -61,60 +74,60 @@ impl Clone for OpAddressMode {
 }
 
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
-pub enum MiddleOperandData {
-    SmallImmediate(i16),
-    IndirectFP(i16),
-    IndirectMP(i16),
-    None
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
+pub struct MiddleOperandData {
+    pub mode: MiddleOpMode,
+    pub imm: i16,
+    pub ind: i16,
 }
+
 
 impl Display for MiddleOperandData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            MiddleOperandData::SmallImmediate(i) => {
-                write!(f, "${}", i)
+        match &self.mode {
+            MiddleOpMode::SmallImmediate => {
+                write!(f, "${}", self.imm)
             }
-            MiddleOperandData::IndirectFP(o) => {
-                write!(f, "{}(fp)", o)
+            MiddleOpMode::SmallOffsetIndFP => {
+                write!(f, "{}(fp)", self.ind)
             }
-            MiddleOperandData::IndirectMP(o) => {
-                write!(f, "{}(mp)", o)
+            MiddleOpMode::SmallOffsetIndMP => {
+                write!(f, "{}(mp)", self.ind)
             }
-            MiddleOperandData::None => {Ok(())}
+            MiddleOpMode::None => {Ok(())}
         }
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
-pub enum SourceDestOperandData {
-    Immediate(i32),
-    IndirectMP(i32),
-    IndirectFP(i32),
-    DoubleIndirectMP(i16, i16),
-    DoubleIndirectFP(i16, i16),
-    None
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
+pub struct SourceDestOperandData {
+    pub mode: SourceDestOpMode,
+    pub imm: i32,
+    pub ind: i32,
+    pub ind2: i32
 }
+
 
 impl Display for SourceDestOperandData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            SourceDestOperandData::Immediate(i) => {
-                write!(f, "${}", i)
+        match &self.mode {
+            SourceDestOpMode::WordImmediate => {
+                write!(f, "${}", self.imm)
             }
-            SourceDestOperandData::IndirectMP(ind) => {
-                write!(f, "${}(mp)", ind)
+            SourceDestOpMode::OffsetIndMP=> {
+                write!(f, "${}(mp)", self.ind)
             }
-            SourceDestOperandData::IndirectFP(ind) => {
-                write!(f, "${}(fp)", ind)
+            SourceDestOpMode::OffsetIndFP => {
+                write!(f, "${}(fp)", self.ind)
             }
-            SourceDestOperandData::DoubleIndirectMP(ind1, ind2) => {
-                write!(f, "${}({}(mp))", ind2, ind1)
+            SourceDestOpMode::DoubleIndMP => {
+                write!(f, "${}({}(mp))", self.ind2, self.ind)
             }
-            SourceDestOperandData::DoubleIndirectFP(ind1, ind2) => {
-                write!(f, "${}({}(fp))", ind2, ind1)
+            SourceDestOpMode::DoubleIndFP => {
+                write!(f, "${}({}(fp))", self.ind2, self.ind)
             }
-            SourceDestOperandData::None => {Ok(())}
+            SourceDestOpMode::None => {Ok(())}
+            _ => {Ok(())}
         }
     }
 }
@@ -134,10 +147,21 @@ impl Instruction {
         Instruction {
             opcode: Opcode::INOP,
             address: OpAddressMode::from_bytes([0]),
-            middle_data: MiddleOperandData::None,
-            src_data: SourceDestOperandData::None,
-            dest_data: SourceDestOperandData::None,
+            middle_data: MiddleOperandData::default(),
+            src_data: SourceDestOperandData::default(),
+            dest_data: SourceDestOperandData::default(),
         }
+    }
+
+    pub fn mid_op_mode(&self) -> MiddleOpMode {
+        self.address.middle_op_mode()
+    }
+    pub fn src_op_mode(&self) -> SourceDestOpMode {
+        self.address.source_op_mode()
+    }
+
+    pub fn dest_op_mode(&self) -> SourceDestOpMode {
+        self.address.dest_op_mode()
     }
 }
 
@@ -151,10 +175,10 @@ impl Debug for Instruction {
 impl Display for Instruction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ", INSTR_MNEMONICS[self.opcode as usize])?;
-        if self.middle_data == MiddleOperandData::None {
-            if self.src_data == SourceDestOperandData::None {
+        if self.mid_op_mode() == MiddleOpMode::None {
+            if self.src_op_mode() == SourceDestOpMode::None {
                 write!(f, "{}", self.dest_data)
-            } else if self.dest_data == SourceDestOperandData::None {
+            } else if self.dest_op_mode() == SourceDestOpMode::None {
                 write!(f, "{}", self.src_data)
             } else {
                 write!(f, "{}, {}", self.src_data, self.dest_data)
@@ -255,10 +279,11 @@ impl Debug for TypeMap {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Type {
-    pub(crate) desc_no: i32,
-    pub(crate) size: i32,
-    pub(crate) map_size: i32,
-    pub(crate) map: TypeMap
+    pub desc_no: i32,
+    pub size: i32,
+    pub map_size: i32,
+    pub map: TypeMap,
+    pub rc: i32,
 }
 
 impl Type {
@@ -268,6 +293,7 @@ impl Type {
             size: 0,
             map_size: 0,
             map: TypeMap { bytes: vec![] },
+            rc: 0
         }
     }
 
@@ -283,6 +309,66 @@ impl Type {
             return (byte_map >> bit_index) & 0x01 == 0x01;
         }
         return false;
+    }
+}
+
+
+#[derive(BitfieldSpecifier, Debug, PartialEq, Eq, Copy, Clone)]
+#[bits=4]
+pub enum DataCodeType {
+    Byte          = 0b0001,
+    Integer32     = 0b0010,
+    StringUTF     = 0b0011,
+    Float         = 0b0100,
+    Array         = 0b0101,
+    ArraySetIndex = 0b0110,
+    RestoreBase   = 0b0111,
+    Integer64     = 0b1000,
+}
+
+#[derive(Copy, Clone)]
+#[bitfield(bits=8)]
+pub struct DataCode {
+    #[bits=4]
+    count: B4,
+    #[bits=4]
+    pub data_type: DataCodeType,
+}
+
+impl Debug for DataCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.data_type_or_err() {
+            Ok(dt) => {
+                write!(f, "DataCode {{ size: {}, type: {:?} }}", self.count(), dt)
+            }
+            Err(bit) => {
+                write!(f, "DataCode {{ unrecognized: {:?} }}", bit.invalid_bytes)
+            }
+        }
+    }
+}
+
+impl Display for DataCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.data_type_or_err() {
+            Ok(dt) => {
+                write!(f, "DataCode {{ size: {}, type: {:?} }}", self.count(), dt)
+            }
+            Err(bit) => {
+                write!(f, "DataCode {{ unrecognized: {:?} }}", bit.invalid_bytes)
+            }
+        }
+    }
+}
+
+impl DataCode {
+
+    pub fn is_zero(&self) -> bool {
+        return self.bytes[0] == 0;
+    }
+
+    pub fn get_count(&self) -> u8 {
+        return self.count() as u8;
     }
 }
 
@@ -308,16 +394,16 @@ impl DataSection {
 }
 
 #[derive(Debug)]
-pub struct Export {
+pub struct Link {
     pub(crate) entry_pc: i32,
     pub(crate) desc: i32,
     pub(crate) sig: i32,
     pub(crate) fn_name: String
 }
 
-impl Export {
+impl Link {
     pub fn new() -> Self {
-        Export {
+        Link {
             entry_pc: 0,
             desc: 0,
             sig: 0,
@@ -488,31 +574,35 @@ pub fn parse_word(bytes: &[u8]) -> i32 {
 pub const MODULE_TYPE_DESC: i32 = 0;
 pub const ARRAY_PARSER_STACK: usize = 10;
 
+type Ptr = u32;
+
 #[derive(Debug)]
-pub struct DisModule {
+pub struct Module {
     magic: DisMagicNo,
     signature: Option<Vec<u8>>,
-    pub runtime_flag: DisRuntimeFlag,
-    pub stack_extent: i32,
-    code_size: i32,
-    data_size: i32,
-    type_size: i32,
-    link_size: i32,
+    pub runtime_flag: DisRuntimeFlag, // rt
+    pub stack_extent: i32,            // ss
+    code_size: i32,                   // isize
+    data_size: i32,                   // dsize
+    type_size: i32,                   // hsize
+    link_size: i32,                   // lsize
     pub entry_pc: i32,
     pub entry_type: i32,
     pub code: Vec<Instruction>,
     pub types: Vec<Type>,
+    pub origmp: Option<Ptr>,
     pub data: Vec<DataSection>,
     pub module_name: String,
-    pub exports: Vec<Export>,
+    pub exports: Vec<Link>,
     pub imports: Vec<ModuleImport>,
     pub handlers: HandlerSection,
-    pub module_src_path: String
+    pub module_src_path: String,
+    pub module_heap: Option<ModuleHeap>,
 }
 
-impl DisModule {
+impl Module {
     pub fn new() -> Self {
-        DisModule {
+        Module {
             magic: DisMagicNo::XMAGIC,
             signature: None,
             runtime_flag: DisRuntimeFlag::MUSTCOMPILE,
@@ -525,17 +615,26 @@ impl DisModule {
             entry_type: 0,
             code: vec![],
             types: vec![],
+            origmp: None,
             data: vec![],
             exports: vec![],
             imports: vec![],
             handlers: HandlerSection::new(),
             module_name: String::new(),
-            module_src_path: String::new()
+            module_src_path: String::new(),
+            module_heap: None,
         }
+    }
+
+    pub fn module_data_type(&self) -> &Type {
+        &self.types[0]
+    }
+    pub fn entry_frame_type(&self) -> &Type {
+        &self.types[self.entry_type as usize]
     }
 }
 
-pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
+pub fn load_module(name: &str) -> Result<Module, std::io::Error> {
 
     let mut file = File::open(&name)?;
 
@@ -544,7 +643,7 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
 
 
 
-    let mut dis = DisModule::new();
+    let mut dis = Module::new();
 
     file.read_to_end(&mut buffer).expect("failed to read module");
 
@@ -634,15 +733,16 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
             match ins.address.middle_op_mode() {
                 MiddleOpMode::None => {}
                 MiddleOpMode::SmallImmediate => {
-                    ins.middle_data = MiddleOperandData::SmallImmediate(data.into_i16())
+                    ins.middle_data.imm = data.into_i16();
                 }
                 MiddleOpMode::SmallOffsetIndFP => {
-                    ins.middle_data = MiddleOperandData::IndirectFP(data.into_i16())
+                    ins.middle_data.ind = data.into_i16();
                 }
                 MiddleOpMode::SmallOffsetIndMP => {
-                    ins.middle_data = MiddleOperandData::IndirectMP(data.into_i16())
+                    ins.middle_data.ind = data.into_i16();
                 }
             }
+            ins.middle_data.mode = ins.mid_op_mode();;
         }
 
         if ins.address.source_op_mode() != SourceDestOpMode::None {
@@ -651,24 +751,26 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
 
             match ins.address.source_op_mode() {
                 SourceDestOpMode::OffsetIndMP => {
-                    ins.src_data = SourceDestOperandData::IndirectMP(data.into_i32());
+                    ins.src_data.ind = data.into_i32();
                 }
                 SourceDestOpMode::OffsetIndFP => {
-                    ins.src_data = SourceDestOperandData::IndirectFP(data.into_i32());
+                    ins.src_data.ind = data.into_i32();
                 }
                 SourceDestOpMode::WordImmediate => {
-                    ins.src_data = SourceDestOperandData::Immediate(data.into_i32());
+                    ins.src_data.imm = data.into_i32();
                 }
                 SourceDestOpMode::None => {}
                 SourceDestOpMode::DoubleIndMP => {
                     let data2 = parse_operand(buffer.get(offset..offset+4).expect("Unable to read source operand second indirect"));
                     offset += data2.size();
-                    ins.src_data = SourceDestOperandData::DoubleIndirectMP(data.into_i16(), data2.into_i16())
+                    ins.src_data.ind = data.into_i32();
+                    ins.src_data.ind2 = data2.into_i32();
                 }
                 SourceDestOpMode::DoubleIndFP => {
                     let data2 = parse_operand(buffer.get(offset..offset+4).expect("Unable to read source operand second indirect"));
                     offset += data2.size();
-                    ins.src_data = SourceDestOperandData::DoubleIndirectFP(data.into_i16(), data2.into_i16())
+                    ins.src_data.ind = data.into_i32();
+                    ins.src_data.ind2 = data2.into_i32();
                 }
                 SourceDestOpMode::Reserved1 => {
                     //panic!("Unknown Source Operand Data")
@@ -677,6 +779,7 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
                     //panic!("Unknown Source Operand Data")
                 }
             }
+            ins.src_data.mode = ins.src_op_mode();
         }
 
         if ins.address.dest_op_mode() != SourceDestOpMode::None {
@@ -685,28 +788,31 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
 
             match ins.address.dest_op_mode() {
                 SourceDestOpMode::OffsetIndMP => {
-                    ins.dest_data = SourceDestOperandData::IndirectMP(data.into_i32());
+                    ins.dest_data.ind = data.into_i32();
                 }
                 SourceDestOpMode::OffsetIndFP => {
-                    ins.dest_data = SourceDestOperandData::IndirectFP(data.into_i32());
+                    ins.dest_data.ind = data.into_i32();
                 }
                 SourceDestOpMode::WordImmediate => {
-                    ins.dest_data = SourceDestOperandData::Immediate(data.into_i32());
+                    ins.dest_data.imm = data.into_i32();
                 }
                 SourceDestOpMode::None => {}
                 SourceDestOpMode::DoubleIndMP => {
                     let data2 = parse_operand(buffer.get(offset..offset+4).expect("Unable to read dest operand second indirect"));
                     offset += data2.size();
-                    ins.dest_data = SourceDestOperandData::DoubleIndirectMP(data.into_i16(), data2.into_i16())
+                    ins.dest_data.ind = data.into_i32();
+                    ins.dest_data.ind2 = data2.into_i32();
                 }
                 SourceDestOpMode::DoubleIndFP => {
                     let data2 = parse_operand(buffer.get(offset..offset+4).expect("Unable to read dest operand second indirect"));
                     offset += data2.size();
-                    ins.dest_data = SourceDestOperandData::DoubleIndirectFP(data.into_i16(), data2.into_i16())
+                    ins.dest_data.ind = data.into_i32();
+                    ins.dest_data.ind2 = data2.into_i32();
                 }
                 SourceDestOpMode::Reserved1 => {panic!("Unknown dest Operand Data")}
                 SourceDestOpMode::Reserved2 => {panic!("Unknown dest Operand Data")}
             }
+            ins.dest_data.mode = ins.dest_op_mode();
         }
 
         dis.code.push(ins);
@@ -739,20 +845,23 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
         dis.types.push(type_desc);
     }
 
+
+
+
+    let entry_frame_t = &dis.types[entry_type.into_usize()];
+    println!("Entry Frame Type: {:#?}", entry_frame_t);
+
+    let mut md = ModuleHeap::new(&mut dis.types[0]);
+
     // find module type descriptor
-
-    for desc in &dis.types {
-        if desc.desc_no == MODULE_TYPE_DESC {
-            //println!("{:#?}", desc);
-            println!("Module Type Descriptor: ");
-            if desc.size != dis.data_size {
-                panic!("Module type descriptor invalid");
-            }
+    if (dis.data_size != 0) {
+        let desc = &dis.types[0];
+        println!("Module Type Descriptor: {:#?}", desc);
+        if desc.size != dis.data_size {
+            panic!("Module type descriptor invalid");
         }
-        //println!("{:#?}", desc);
+        dis.origmp = Some(md.module_data_start());
     }
-
-    let mut md = ModuleData::new(&dis.types[0]);
 
     let buffer_copy = buffer.clone();
 
@@ -768,7 +877,7 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
     'data: loop {
         let mut data = DataSection::new();
         let mut count = 0;
-        let mut code = DataCode::from_bytes([0]);
+        let code;
         {
             let mut  r = reader.borrow_mut();
             code = DataCode::from_bytes([r.u8()]);
@@ -786,11 +895,23 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
                 panic!("Invalid data count {} for {:?}", count, code);
             }
         }
-        md.load_data(code, count as usize, &dis.types, reader.clone());
+        md.load_data(code, count as usize, &mut dis.types, reader.clone());
     }
 
+    let d = md.read_module_data::<VmPtr<vm_types::Array>>(312);
+    let a = md.read(&d);
+    for i in 0..a.len {
+        let ptr: VmPtr<u32> = VmPtr::new(a.data).add((i*4) as usize);
+        println!("{}", md.read(&ptr));
+    }
+
+    dis.module_heap = Some(md);
+
     offset = reader.borrow().offset;
-    let mut op = 0;
+
+    //let string = md.get(4);
+
+
     /*for i in &dis.code {
         match i.src_data {
             SourceDestOperandData::Immediate(_) => {}
@@ -831,28 +952,32 @@ pub fn load_module(name: &str) -> Result<DisModule, std::io::Error> {
     // link/export section
 
     for _i in 0..dis.link_size {
-        let mut export = Export::new();
-        let entry_pc = parse_operand(buffer.get(offset..offset+4).expect("Unable to read export entry pc"));
+        let mut Link = Link::new();
+        let entry_pc = parse_operand(buffer.get(offset..offset+4).expect("Unable to read Link entry pc"));
         offset += entry_pc.size();
-        export.entry_pc = entry_pc.into_i32();
+        Link.entry_pc = entry_pc.into_i32();
 
-        let desc = parse_operand(buffer.get(offset..offset+4).expect("Unable to read export type descriptor"));
+        let desc = parse_operand(buffer.get(offset..offset+4).expect("Unable to read Link type descriptor"));
         offset += desc.size();
-        export.desc = desc.into_i32();
+        Link.desc = desc.into_i32();
+        if (Link.desc != 0) {
+            let t = &dis.types[Link.desc as usize];
 
-        export.sig = parse_word(buffer.get(offset..offset+4).expect("Unable to read export type checksum"));
+        }
+
+        Link.sig = parse_word(buffer.get(offset..offset+4).expect("Unable to read Link type checksum"));
         offset += 4;
 
         loop {
-            let c = buffer.get(offset..offset+1).expect("Unable to read export function name")[0];
+            let c = buffer.get(offset..offset+1).expect("Unable to read Link function name")[0];
             offset += 1;
             if c == 0 {
                 break;
             }
-            export.fn_name.push(c as char);
+            Link.fn_name.push(c as char);
         }
 
-        dis.exports.push(export);
+        dis.exports.push(Link);
     }
 
     // import section
