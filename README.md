@@ -19,9 +19,8 @@ An implementation of the Inferno OS Virtual Machine Dis in Rust.
     - [ ] Clean Up
     - [x] Reading and Writing
     - [x] Primitive Types
-    - [ ] Pointer Stuff
-      - [x] Pointer Compression/Emulation
-    - [ ] Dynamic Types
+    - [X] Pointer Stuff
+    - [X] Dynamic Types
 
 
 
